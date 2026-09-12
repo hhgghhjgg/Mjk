@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""9Router local proxy + static server (stdlib only).
+"""MJK translator — static server + 9Router CORS proxy (stdlib only).
 
-Why: 9Router (Railway) does NOT send CORS headers, so browsers block
-direct fetch() from Html.html -> you get "network error". Running this
-proxy on your own machine fixes it: the browser talks to localhost
-(same origin, no CORS problem) and THIS script forwards to 9Router
-with your API key (curl works fine, only browsers are blocked).
+- Serves Html.html in the same folder.
+- Forwards /v1/* to 9Router with the API key (fixes browser CORS).
+- /api/health -> {"ok": true} for Railway/Render health checks.
 
-Run:   python3 proxy_server.py [port, default 8000]
-Open:  http://localhost:8000/Html.html
+Config (env):
+  NINE_ROUTER_API_KEY : 9Router key (required in production)
+  PORT                : injected by Railway/Render (default 8000 locally)
+  HOST                : default 0.0.0.0 when PORT is set, else 127.0.0.1
 """
 import json
 import os
@@ -17,7 +17,7 @@ import urllib.error
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
 UPSTREAM = "https://9router-production-e6c2.up.railway.app/v1"
-API_KEY = os.environ.get("NINE_ROUTER_API_KEY", "sk-d042a2942b66660e-wjdw1y-30603948")
+API_KEY = os.environ.get("NINE_ROUTER_API_KEY", "")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -56,14 +56,23 @@ class Handler(SimpleHTTPRequestHandler):
             self.send_error(404)
 
     def _proxy(self):
+        if not API_KEY:
+            out = json.dumps({"error": "NINE_ROUTER_API_KEY is not set on the server"}).encode()
+            self.send_response(500)
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
         length = int(self.headers.get("Content-Length", 0) or 0)
         body = self.rfile.read(length) if length else b"{}"
-        url = UPSTREAM + self.path[3:]  # strip "/v1" prefix -> keep "/chat/completions" etc.
+        url = UPSTREAM + self.path[3:]  # strip "/v1" -> keep "/chat/completions" etc.
         try:
             req = urllib.request.Request(
                 url, data=body,
                 headers={"Content-Type": "application/json",
-                         "Authorization": f"Bearer {API_KEY}"},
+                         "Authorization": "Bearer " + API_KEY},
                 method="POST" if self.command == "POST" else "GET",
             )
             with urllib.request.urlopen(req, timeout=120) as r:
@@ -83,7 +92,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(out)
         except Exception as e:
-            out = json.dumps({"error": f"proxy failed: {e}"}).encode()
+            out = json.dumps({"error": "proxy failed: %s" % e}).encode()
             self.send_response(502)
             self._cors()
             self.send_header("Content-Type", "application/json")
@@ -97,9 +106,11 @@ class Handler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     import sys
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Open:  http://localhost:{port}/Html.html")
-    print(f"Proxy: http://localhost:{port}/v1  ->  {UPSTREAM}")
-    print("Stop with Ctrl+C")
+    port = int(os.environ.get("PORT", sys.argv[1] if len(sys.argv) > 1 else 8000))
+    host = os.environ.get("HOST", "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1")
+    srv = ThreadingHTTPServer((host, port), Handler)
+    print("Serving %s on %s:%d -> %s" % (HERE, host, port, UPSTREAM), flush=True)
+    print("Open:  http://%s:%d/Html.html" % (host, port), flush=True)
+    print("Proxy: http://%s:%d/v1  ->  %s" % (host, port, UPSTREAM), flush=True)
+    print("Stop with Ctrl+C", flush=True)
     srv.serve_forever()
